@@ -3,6 +3,9 @@
 # Copyright 2012 Janis Jansons (janis.jansons@janhouse.lv)
 #
 
+import os
+import time
+import pickle
 import argparse
 import urllib
 import urllib2
@@ -10,10 +13,89 @@ import gzip
 import sys
 from multiprocessing import Process, Pipe, Manager
 from lxml import etree
-import time
+from collections import defaultdict
 from math import radians, cos, sin, asin, sqrt
 
 from StringIO import StringIO
+
+HTTP_HEADERS = {
+    'Accept' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'User-Agent' : 'Mozilla/5.0 (X11; Linux x86_64; rv:11.0) Gecko/20100101 Firefox/11.0',
+    'Accept-Language' : 'en-us,en;q=0.5',
+    'Connection' : 'keep-alive',
+    'Accept-Encoding' : 'gzip, deflate',
+    #'Referer' : 'http://c.speedtest.net/flash/speedtest.swf?v=301256',
+}
+
+def GetRequest(uri):
+    # Generates a GET request to be used with urlopen
+    req = urllib2.Request(uri, headers = HTTP_HEADERS)
+    return req
+
+def DecompressResponse(response):
+    # Decompress gzipped response
+    data = StringIO(response.read())
+    gzipper = gzip.GzipFile(fileobj=data)
+    return gzipper.read()
+
+class ServerList(object):
+    uri = "http://speedtest.net/speedtest-servers.php?x=" + str( time.time() )
+    cache_filepath = "/tmp/speedtest.servers.xml"
+
+    def __init__(self):
+        self.servers = []
+        self.by_country = defaultdict(list)
+
+    def append(self, server_dict):
+        self.servers.append(server_dict)
+        self.by_country[server_dict['country'].lower()].append(server_dict)
+
+    def cache(self):
+        with file(self.cache_filepath, "w") as cache_file:
+            pickle.dump(self.servers, cache_file)
+
+    def load_cache(self):
+        with file(self.cache_filepath) as cache_file:
+            servers = pickle.load(cache_file)
+        for server in servers:
+            self.append(server)
+
+    def get_cache_time(self):
+        if not os.path.isfile(self.cache_filepath):
+            return 0
+        return os.path.getmtime(self.cache_filepath)
+
+    def load(self, ignore_cache=False):
+        request = GetRequest(self.uri)
+        response = urllib2.urlopen(request);
+        if (ignore_cache is False and time.time() - self.get_cache_time() < 60):
+            self.load_cache()
+            return
+
+        # Load etree from XML data
+        servers_xml = etree.fromstring(DecompressResponse(response))
+        servers = servers_xml.find("servers").findall("server")
+
+        for server in servers:
+            self.append({
+            'lat': float(server.attrib['lat']), 
+            'lon': float(server.attrib['lon']),
+            'url': server.attrib['url'].rsplit('/', 1)[0] + '/',
+            'url2': server.attrib.get('url2', server.attrib['url']).rsplit('/', 1)[0] + '/',
+            'name': server.attrib['name'], 
+            'country': server.attrib['country'], 
+            'sponsor': server.attrib['sponsor'], 
+            'id': server.attrib['id'], 
+            })
+        #always cache after load
+        self.cache()
+
+    @classmethod
+    def fetch(cls):
+        server_list = cls()
+        server_list.load()
+        return server_list
+        
 
 # Using StringIO with callback to measure upload progress
 class CallbackStringIO(StringIO):   
@@ -59,23 +141,13 @@ class CallbackStringIO(StringIO):
 
 class TeSpeed:
 
-    def __init__(self, server = "", numTop = 0, servercount = 3, store = False, suppress = False, unit = False):
-
-        self.headers = {
-            'Accept' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'User-Agent' : 'Mozilla/5.0 (X11; Linux x86_64; rv:11.0) Gecko/20100101 Firefox/11.0',
-            'Accept-Language' : 'en-us,en;q=0.5',
-            'Connection' : 'keep-alive',
-            'Accept-Encoding' : 'gzip, deflate',
-            #'Referer' : 'http://c.speedtest.net/flash/speedtest.swf?v=301256',
-        }
+    def __init__(self, servers, numTop = 0, servercount = 3, store = False, suppress = False, unit = False):
+        self.headers = HTTP_HEADERS
 
         self.num_servers=servercount;
-        self.servers=[]
-        if server != "":
-            self.servers=[server]
+        self.server_list = servers
+        self.servers = []
 
-        self.server=server
         self.down_speed=-1
         self.up_speed=-1
         self.latencycount=10
@@ -93,12 +165,6 @@ class TeSpeed:
         if store:
             print_debug("Printing CSV formated results to STDOUT.\n")
         self.numTop=int(numTop)
-        #~ self.downList=['350x350', '500x500', '750x750', '1000x1000',
-            #~ '1500x1500', '2000x2000', '2000x2000', '2500x2500', '3000x3000',
-            #~ '3500x3500', '4000x4000', '4000x4000', '4000x4000', '4000x4000']
-        #~ self.upSizes=[1024*256, 1024*256, 1024*512, 1024*512, 
-            #~ 1024*1024, 1024*1024, 1024*1024*2, 1024*1024*2, 
-            #~ 1024*1024*2, 1024*1024*2]
 
         self.downList=[
         '350x350', '350x350', '500x500', '500x500', '750x750', '750x750', '1000x1000', '1500x1500', '2000x2000', '2500x2500',
@@ -550,16 +616,8 @@ class TeSpeed:
 
     def TestSpeed(self):
 
-        if self.server=='list-servers':
-            self.config=self.LoadConfig()
-            self.server_list=self.LoadServers()
-            self.ListServers(self.numTop)
-            return
-            
-        if self.server == '':
-            self.config=self.LoadConfig()
-            self.server_list=self.LoadServers()
-            self.FindBestServer()
+        self.config=self.LoadConfig()
+        self.FindBestServer()
 
         self.TestDownload()
         self.TestUpload()
@@ -586,23 +644,31 @@ def print_result(string):
 
 def main(args):
 
+    server_list = ServerList.fetch()
     if args.listservers:
-        args.store=True
+        return
+    server_subset = []
+    if args.country is not None:
+        server_subset = server_list.by_country[args.country.lower()]
+    else:
+        server_subset = server_list.servers
+
+    if len(server_subset) == 0:
+        exit("No servers in the list")
 
     if args.listservers!=True and args.server=='' and args.store!=True:
         print_debug("Getting ready. Use parameter -h or --help to see available features.\n")
     else:
         print_debug("Getting ready\n")
     try:
-        t=TeSpeed(args.listservers and 'list-servers' or args.server, args.listservers, args.servercount, args.store and True or False, args.suppress and True or False, args.unit and True or False)
+        t=TeSpeed(server_subset, args.listservers, args.servercount, args.store and True or False, args.suppress and True or False, args.unit and True or False)
     except (KeyboardInterrupt, SystemExit):
         print_debug("\nTesting stopped.\n")
         #raise
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TeSpeed, CLI SpeedTest.net')
-
-    parser.add_argument('country', nargs='?', type=str, default=None, help='Test only to servers of this country');
+    parser.add_argument('-c','--country', dest='country', nargs='?', type=str, default=None, help='Test only to servers of this country');
     parser.add_argument('server', nargs='?', type=str, default='', help='Use the specified server for testing (skip checking for location and closest server).')
     parser.add_argument('-ls', '--list-servers', dest='listservers', nargs='?', default=0, const=10, help='List the servers sorted by distance, nearest first. Optionally specify number of servers to show.')
     parser.add_argument('-w', '--csv', dest='store', action='store_const', const=True, help='Print CSV formated output to STDOUT.')
