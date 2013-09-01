@@ -327,7 +327,7 @@ class TeSpeed:
         #   print_debug('\n')
 
 
-    def ChunkRead(self, response, num, th, d, w=0, chunk_size=10240, report_hook=None):
+    def ChunkRead(self, response, num, th, d, w=0, chunk_size=1024, report_hook=None):
         #print_debug("Thread num %d %d %d starting to report\n" % (th, num, d))
         if(w==1):
             return [0,0,0]
